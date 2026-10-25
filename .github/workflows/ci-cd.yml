@@ -1,0 +1,102 @@
+name: CI/CD - ShopEase Support Agent
+
+on:
+  pull_request:
+    branches: [main]     # PR pe sirf CI (test)
+  push:
+    branches: [main]     # main pe merge → CI + build + deploy
+
+env:
+  AWS_REGION: ap-south-1                 # Mumbai
+  ECR_REPOSITORY: shopease-support-agent
+  CONTAINER_NAME: shopease
+
+jobs:
+  # ---------- 1. CI: lint + test ----------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Unit tests (no real OpenAI calls)
+        run: pytest -q
+
+  # ---------- 2. Build Docker image → push to Amazon ECR ----------
+  build-and-push:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      registry: ${{ steps.ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: ${{ github.sha }}
+        run: |
+          IMAGE=$REGISTRY/$ECR_REPOSITORY:$TAG
+          docker build --build-arg APP_VERSION=${TAG::7} -t $IMAGE -t $REGISTRY/$ECR_REPOSITORY:latest .
+          docker push $IMAGE
+          docker push $REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  # ---------- 3. CD: deploy on EC2 ----------
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production        # GitHub me approval rule laga sakte ho
+    steps:
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          REGISTRY: ${{ needs.build-and-push.outputs.registry }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE,REGISTRY,AWS_REGION,CONTAINER_NAME
+          script: |
+            set -e
+            # EC2 ka IAM role ECR se pull karne deta hai — koi AWS key server pe nahi
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY
+            docker pull $IMAGE
+            docker stop $CONTAINER_NAME 2>/dev/null || true
+            docker rm $CONTAINER_NAME 2>/dev/null || true
+            docker run -d --name $CONTAINER_NAME --restart unless-stopped \
+              -p 80:8000 --env-file /home/ec2-user/shopease.env $IMAGE
+            docker image prune -af --filter "until=72h" || true   # purani images hata ke disk bachao
+            # Smoke test: app 60s me healthy nahi hua to pipeline fail
+            for i in $(seq 1 12); do
+              if curl -fs http://localhost/health; then echo " ✅ Deployed $IMAGE"; exit 0; fi
+              sleep 5
+            done
+            echo "❌ Health check failed"; docker logs --tail 50 $CONTAINER_NAME; exit 1

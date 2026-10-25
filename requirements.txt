@@ -1,0 +1,6 @@
+fastapi==0.162.0
+uvicorn[standard]==0.53.0
+gradio==6.30.0
+langchain-core==1.6.12
+langchain-openai==1.7.2
+langgraph==1.2.16
